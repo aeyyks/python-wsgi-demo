@@ -13,6 +13,10 @@ def application(environ, start_response):
         return handle_home(method, query_string, start_response)
     elif path == '/echo' and method == 'POST':
         return handle_echo(environ, start_response)
+    elif path == '/profile':
+        # Этот обработчик уверен, что раз запрос до него дошел,
+        # значит AuthMiddleware уже проверил токен и положил юзера в environ
+        return handle_profile(environ, start_response)
     else:
         return handle_not_found(path, start_response)
 
@@ -72,9 +76,18 @@ def handle_not_found(path, start_response):
     return [f"404: Путь '{path}' не найден".encode('utf-8')]
 
 
+def handle_profile(environ, start_response):
+    # Достаем пользователя, которого положил AuthMiddleware!
+    user = environ.get('CURRENT_USER', {})
+
+    start_response('200 OK', [('Content-Type', 'text/plain; charset=utf-8')])
+    text = f"Добро пожаловать в личный кабинет!\nВаше имя: {user.get('name')}\nВаша роль: {user.get('role')}"
+    return [text.encode('utf-8')]
+
+
 # --- 2. MIDDLEWARE (Аналог Servlet Filter) ---
 
-class TimingAndHeaderMiddleware:
+class TimingMiddleware:
     """
     Используем класс с методом __call__, чтобы объект вел себя как функция.
     """
@@ -116,7 +129,56 @@ class TimingAndHeaderMiddleware:
         return response_iterable
 
 
+# --- 2. MIDDLEWARE АВТОРИЗАЦИИ (Аналог SecurityFilter в Java) ---
+class AuthMiddleware:
+    # Имитация базы данных с валидными токенами
+    TOKENS_DB = {
+        'secret-token-123': {'name': 'Seva', 'role': 'admin'},
+        'user-token-456': {'name': 'Mary', 'role': 'developer'},
+    }
+
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        path = environ.get('PATH_INFO', '/')
+
+        # 1. Публичные маршруты пропускаем без проверки
+        if path != '/profile':
+            return self.app(environ, start_response)
+
+        # 2. Достаем заголовок Authorization (в WSGI он имеет префикс HTTP_)
+        auth_header = environ.get('HTTP_AUTHORIZATION', '')
+
+        # Проверяем формат "Bearer <токен>"
+        if not auth_header.startswith('Bearer '):
+            return self._unauthorized(start_response, "Отсутствует заголовок Authorization: Bearer <token>")
+
+        token = auth_header.split(' ')[1]
+        user = self.TOKENS_DB.get(token)
+
+        # 3. Если токен не найден — прерываем запрос и не пускаем его в приложение!
+        if not user:
+            return self._unauthorized(start_response, "Неверный или просроченный токен")
+
+        # 4. Токен верный! Обогащаем environ данными пользователя (Security Context)
+        environ['CURRENT_USER'] = user
+
+        # Передаем управление дальше по цепочке
+        return self.app(environ, start_response)
+
+    def _unauthorized(self, start_response, message):
+        status = '401 Unauthorized'
+        headers = [
+            ('Content-Type', 'text/plain; charset=utf-8'),
+            ('WWW-Authenticate', 'Bearer')  # Стандартный заголовок для 401 ответа
+        ]
+        start_response(status, headers)
+        return [f"401 Доступ запрещен: {message}".encode('utf-8')]
+
+
 # --- 3. СБОРКА МАТРЕШКИ ---
 # Оборачиваем application в наш Middleware.
 # Для Waitress переменная `application` по-прежнему выглядит как обычная функция!
-application = TimingAndHeaderMiddleware(application)
+# Запрос идет снаружи внутрь: TimingMiddleware -> AuthMiddleware -> application
+application = TimingMiddleware(AuthMiddleware(application))
